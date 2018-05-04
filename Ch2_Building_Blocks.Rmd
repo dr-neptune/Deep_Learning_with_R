@@ -1,0 +1,297 @@
+---
+title: "Untitled"
+author: "Michael Rose"
+date: "April 28, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(keras)
+library(reticulate)
+use_python('/home/michael/anaconda3/bin/python3')
+```
+
+```{python}
+from keras.datasets import mnist
+mnist = mnist.load_data()
+```
+
+
+```{r}
+mnist <- dataset_mnist()
+```
+
+```{r}
+train_images <- mnist$train$x
+train_labels <- mnist$train$y
+test_images <- mnist$test$x
+test_labels <- mnist$test$y
+
+str(train_images)
+str(train_labels)
+str(test_images)
+str(test_labels)
+```
+
+```{r}
+# train
+network <- keras_model_sequential() %>% 
+  layer_dense(units = 512, activation = "relu", input_shape = c(28*28)) %>% 
+  layer_dense(units = 10, activation = "softmax")
+```
+
+Here our model consists of a sequence of 2 layers. The second layer is a 10-way softmax layer, which means it will return an array of 10 probability scores (summing to 1).
+Each score will be the probability that the current digit image belows to one of our 10 digit classes. 
+
+To make the network ready, we need the following: 
+  1. A loss function - How the network will be able to measure its performance on the training data, and thus how it will be able to steer itself in the right direction
+  2. An optimizer - The mechanism through which the network will update itself based on the data it sees and its loss function
+  3. Metrics to monitor during training and testing - Here, we onlyc are about accuracy (fraction of images correctly classified)
+
+```{r}
+# compilation
+network %>% compile(
+  optimizer = "rmsprop",
+  loss = "categorical_crossentropy",
+  metrics = c("accuracy")
+)
+```
+
+```{r}
+# preparing the image data to normalize them within a [0, 1] interval
+train_images <- array_reshape(train_images, c(60000, 28*28))
+train_images <- train_images / 255
+
+test_images <- array_reshape(test_images, c(10000, 28 * 28))
+test_images <- test_images / 255
+
+train_labels <- to_categorical(train_labels)
+test_labels <- to_categorical(test_labels)
+```
+
+```{r}
+# train the network!
+network %>% fit(train_images, train_labels, epochs = 5, batch_size = 128)
+```
+
+```{r}
+# test set
+(metrics <- network %>% evaluate(test_images, test_labels))
+
+# generate predictions for the first 10 samples of the test set
+network %>% predict_classes(test_images[1:10,])
+```
+
+# Data Representations for Neural Networks
+
+```{r}
+# vector is a 1D tensor
+x <- c(12, 3, 6, 14, 10)
+str(x)
+dim(as.array(x))
+
+#matrix is a 2d tensor
+x <- matrix(rep(0, 3*5), nrow = 3, ncol = 5)
+x
+dim(x)
+
+# 3D + tensors
+# pack matrices into an array for a 3D tensor
+x <- array(rep(0, 2*3*2), dim = c(2,3,2))
+str(x)
+dim(x)
+
+# by packing 3D tensors into an array we create a 4d tensor, and so on. Generally deep learning uses 0->4D, but we use 5D if we process video
+```
+
+## Key Attributes
+
+Tensor Characteristics: 
+  1. Rank - Number of Axes
+  2. Shape - Integer that describes how many dimensions the tensor has along each axis. Can access using dim()
+  3. Data Type - Usually int or double.
+
+```{r}
+# train images before array shape
+train_images <- mnist$train$x
+# number of axes
+length(dim(train_images))
+# shape 
+dim(train_images)
+# data type
+typeof(train_images)
+
+# plot the 5th digit in this 3D tensor
+digit <- train_images[5,,]
+plot(as.raster(digit, max = 255))
+```
+
+## Manipulating Tensors in R
+
+```{r}
+# selecting a specific element in a tensor is called tensor slicing
+
+# select digits #10 to #99 and put them in an array of shape (90, 28, 28)
+my_slice <- train_images[10:99,,]
+dim(my_slice)
+
+# in general, we can select between any 2 indices. For example, if we wanted to select the botton right 14x14 pixels we could do this: 
+my_slice_14x14 <- train_images[10:99, 15:28, 15:28]
+
+# generally, the first axis is the sample axis. DL models break the data into small batches.
+
+# batch of mnist digits with a batch size of 128
+batch <- train_images[1:128, ,]
+# then the next batch
+batch2 <- train_images[129: 256, ,]
+```
+
+When considering a batch tensor, the first axis is called the batch axis or batch dimension. 
+
+Examples of data tensors: 
+
+  1. Vector data - 2D tensors (samples, features)
+  2. Timeseries Data - 3D tensors (samples, timesteps, features)
+  3. Images - 4D tensors (samples, height, width, channels) or (samples, channels, height, width)
+  4. Video - 5D tensors (samples, frames, height, width, channels) or (samples, frames, channels, height, width)
+
+## Element-Wise Operations
+
+```{r}
+# naive element wise operation
+naive_relu <- function(x){
+  for (i in nrow(x))
+    for (j in ncol(x))
+      x[i, j] <- max(x[i, j], 0)
+  x
+}
+
+# naive element wise add
+
+naive_add <- function(x, y){
+  for (i in nrow(x))
+    for (j in ncol(x))
+      x[i, j] <- x[i, j] + y[i, j]
+  x
+}
+
+# actual R implementation
+z <- x + y
+z <- pmax(z, 0)
+```
+
+## Operations involving tensors of different dimensions 
+
+sweep() allows us to perform operations between higher dimensional and lower dimensional tensors. 
+
+```{r}
+# with sweep we could perform a maxtrix + vector addition as follows:
+x <- matrix(rep(0,3*3), nrow = 3, ncol = 3)
+y <- c(3, 6, 9)
+sweep(x, 2, y, '+')
+
+# sweep a 2D tensors over the last two dimensions of a 4D tensor using the pmax() function
+x <- array(round(runif(1000, 0, 9)), dim = c(64, 3, 32, 10)) # 4D tensor
+y <- array(5, dim = c(32, 10)) # 32x10 matrix filled with 5s
+
+z <- sweep(x, c(3, 4), y, pmax) # z has the same shape as x
+```
+
+## Tensor Dot | Also called Tensor Product
+
+```{r}
+naive_vector_dot <- function(x, y){ # x, y are 1D tensors (vectors)
+  z <- 0
+  for (i in 1:length(x))
+    z <- z + x[[i]] * y[[i]]
+  z
+}
+
+# for a dot product between a matrix and a vector
+
+# Regular implementation
+naive_matrix_vector_dot <- function(x, y){
+  z <- rep(0, nrow(x))
+  for (i in 1:nrow(x))
+    for (j in 1:ncol(x))
+      z[[i]] <- z[[i]] + x[[i, j]] * y[[i, j]]
+  z
+}
+
+# reusing the code from earlier
+naive_matrix_vector_dot <- function(x, y){
+  z <- rep(0, nrow(x))
+  for (i in 1:nrow(x))
+    z[[i]] <- naive_vector_dot(x[i,], y)
+  z
+}
+
+# You can take the dot product of 2 matrices iff ncol(x) == nrow(y)
+
+naive_matrix_dot <- function(x, y){
+  z <- matrix(0, nrow = nrow(x), ncol = ncol(y))
+  for (i in 1:nrow(x))
+    for (j in 1:ncol(y)){
+      row_x <- x[i,]
+      column_y <- y[,j]
+      z[i, j] <- naive_vector_dot(row_x, column_y)
+    }
+  z
+}
+```
+
+## Tensor Reshaping
+
+You should always use the array_reshape() function when reshaping R arrays that will be passed to keras.
+Reshaping a tensor means rearranging its rows and columns to match a target shape.
+
+```{r}
+# input
+x <- matrix(c(0,1,
+              2,3,
+              4,5), nrow = 3, ncol = 2, byrow = TRUE)
+x
+
+# reshape
+
+x <- array_reshape(x, dim = c(6, 1))
+x
+
+x <- array_reshape(x, dim = c(2, 3))
+x
+
+# a special type of reshaping thats common is called transposition. 
+# transposing a mtrix means exchanging its rows and columns so that x[i,] becomes x[, i]
+x <- matrix(0, nrow = 300, ncol = 20)
+dim(x)
+x <- t(x)
+dim(x)
+```
+
+## Stochastic Gradient Descent
+
+1. Draw a batch of training samples x and corresponding targets y
+2. Run the network on x to obtain y_pred
+3. Compute the loss of the network on the batch, a measure of the mismatch between y_pred and y
+4. Compute the gradient of the loss with regard to the networks parameters (a backward pass)
+5. Move the parameters a little in the opposite direction from the gradient - for example W = W - (step * gradient) - thus reducing the loss on the batch a bit
+
+
+```{r}
+# naive stochastic gradient descent
+
+past_velocity <- 0
+momentum <- 0.1
+while (loss > 0.01){
+  params <- get_current_parameters()
+  w <- params$w
+  loss <- params$loss
+  gradient <- params$gradient
+  velocity <- past_velocity * momentum + learning_rate * gradient
+  past_velocity <- velocity 
+  update_parameter(w)
+}
+```
+
+

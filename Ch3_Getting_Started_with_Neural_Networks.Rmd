@@ -1,0 +1,159 @@
+---
+title: "Untitled"
+author: "Michael Rose"
+date: "April 29, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(keras)
+library(reticulate)
+use_python('/home/michael/anaconda3/bin/python3')
+```
+
+Training a NN revolves around the following objects: 
+  1. Layers, which are combined into a network (or model)
+  2. Input data and corresponding targets
+  3. loss function which defines the feedback signal used for learning
+  4. optimizer which determines how learning proceeds
+  
+# Layers - The Building Blocks of Deep Learning
+
+The typical keras workflow looks something like: 
+
+  1. Define your training data (input tensors and target tensors)
+  2. Define a network of layers (or model) that maps your inputs to your targets
+  3. Configure the learning process by choosing a loss function, an optimizer, and some metrics to monitor
+  4. Iterate on your training data by calling the fit() method of your model
+
+```{r}
+
+# step 2
+# linear stacks of layers
+model <- keras_model_sequential() %>% 
+  layer_dense(units = 32, input_shape = c(784)) %>% 
+  layer_dense(units = 10, activation = "softmax")
+
+# same model with functional api
+input_tensor <- layer_input(shape = c(784))
+output_tensor <- input_tensor %>% 
+  layer_dense(units = 32, activation = "relu") %>% 
+  layer_dense(units = 10, activation = "softmax")
+
+model <- keras_model(inputs = input_tensor, outputs = output_tensor)
+
+# with the functional api we are manipulating data tensors that the model processes and applying layers to this tensor as if they were functions
+
+# step 3
+# example using a single loss function
+
+model %>% compile(
+  optimizer = optimizer_rmsprop(lr = 0.0001),
+  loss = "mse",
+  metrics = c("accuracy")
+)
+
+# step 4
+model %>% fit(input_tensor, target_tensor, batch_size = 128, epochs = 10)
+
+```
+
+# IMDB
+
+```{python}
+from keras.datasets import imdb
+imdb = imdb.load_data()
+# imdb_word_index = imdb.get_word_index()
+```
+
+```{r}
+# %<-% is the multiassignment operator from the zeallot package. It allows us to unpack the list into a set of distinct variables
+imdb <- dataset_imdb(num_words = 10000)
+c(c(train_data, train_labels), c(test_data, test_labels)) %<-% imdb
+
+# alternatively, the code above pans out to 
+
+imdb <- dataset_imdb(num_words = 10000)
+train_data <- imdb$train$x
+train_labels <- imdb$train$y
+test_data <- imdb$test$x
+test_labels <- imdb$test$y
+
+```
+
+```{r}
+# show encoding indices
+str(train_data[[1]])
+
+# decode words back to english
+word_index <-dataset_imdb_word_index() # named list mapping words to integer index
+reverse_word_index <- names(word_index) # reverses it, mapping integer indices to words
+names(reverse_word_index) <- word_index
+decoded_review <- sapply(train_data[[1]], function(index) {
+  word <- if (index >= 3) reverse_word_index[[as.character(index - 3)]]
+  if (!is.null(word)) word else "?"
+})
+
+```
+
+You can't just feed lists of integers into a neural network - we have to turn them into tensors first. Either: 
+  1. Pad your lists so that they all have the same length, turn them into an integer tensor of shape (samples, word_indices) 
+  2. One-shot encode our lists into vectors of 0s and 1s - e.g. [3,5] is a tensor with all 0s except for 3 and 5 which are ones
+
+```{r}
+# encoding sequences into a binary matrix (choice 2)
+vectorize_sequences <- function(sequences, dimension = 10000) {
+  results <- matrix(0, nrow = length(sequences), ncol = dimension) # creates an all zero matrix of shape (length(sequences), dimension)
+  for (i in 1:length(sequences))
+    results[i, sequences[[i]]] <- 1 # set specific indices of results[i] to 1s
+  results
+}
+
+x_train <- vectorize_sequences(train_data)
+x_test <- vectorize_sequences(test_data)
+
+str(x_train[1,]) # take a look at the data
+
+# convert labels from integer to numeric
+y_train <- as.numeric(train_labels)
+y_test <- as.numeric(test_labels)
+```
+
+```{r}
+# create model. returns a probability by ending the network with the sigmoid function
+
+model <- keras_model_sequential() %>% 
+  layer_dense(units = 16, activation = "relu", input_shape = c(10000)) %>% 
+  layer_dense(units = 16, activation = "relu") %>% 
+  layer_dense(units = 1, activation = "sigmoid")
+
+# choose a loss function and optimizer
+
+model %>% compile(
+  optimizer = "rmsprop",
+  loss = "binary_crossentropy",
+  metrics = c("accuracy")
+)
+
+# sometimes we may want to tweak the compilation a bit: 
+
+# configure optimizer parameters: 
+
+model %>% compile(
+  optimizer = optimizer_rmsprop(lr=0.001),
+  loss = "binary_crossentropy",
+  metrics = c("accuracy")
+)
+
+# using custom losses and metrics
+model %>% compile(
+  optimizer = optimizer_rmsprop(lr = 0.001),
+  loss = loss_binary_crossentropy, # function argument
+  metrics = metric_binary_accuracy # function argument
+)
+
+
+
+ ```
+
