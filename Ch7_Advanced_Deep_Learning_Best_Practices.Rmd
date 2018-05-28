@@ -1,0 +1,719 @@
+---
+title: "Ch7_Advanced_Deep_Learning_Best_Practices"
+author: "Michael Rose"
+date: "May 27, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(keras)
+```
+
+This chapter covers: 
+  - The Keras functional API
+  - Using Keras callbacks
+  - Working with tensorboard visualization tool
+  - Important best practices for developing state-of-the-art models 
+  
+# Going beyond the sequential model: the Keras functional API
+
+The sequential model assumes that the network has exactly one input and one output, and that it consists of a linear stack of layers. 
+
+We can create directed graphs with specific layer paths. This allows us to have models that have multiple inputs, multiple outputs, and also process multiple types of data concurrently. 
+Good examples are the inception networks by google and the resnet models by microsoft. 
+
+## Introduction to the functional API
+
+In the functional API, we build our input and output layers and then pass them to the keras_model function. 
+
+```{r}
+# sequential model 
+seq_model <- keras_model_sequential() %>% 
+  layer_dense(units = 32, activation = "relu", input_shape = c(64)) %>% 
+  layer_dense(units = 32, activation = "relu") %>% 
+  layer_dense(units = 10, activation = "softmax")
+
+# its functional equivalent
+input_tensor <- layer_input(shape = c(64))
+output_tensor <- input_tensor %>% 
+  layer_dense(units = 32, activation = "relu") %>% 
+  layer_dense(units = 32, activation = "relu") %>% 
+  layer_dense(units = 10, activation = "softmax")
+
+model <- keras_model(input_tensor, output_tensor) # the keras_model function turns an input tensor and output tensor into a model 
+
+summary(model)
+summary(seq_model)
+```
+
+Behind the scenes, Keras retrieves every layer involved in going from input_tensor to output_tensor, bringing them together into a graph like data-structure - a model. This works because output_tensor was created by repeatedly transforming input_tensor. 
+
+If we tried to build a model from unrelated input and output tensors, we would get an error: 
+
+```{r}
+# unrelated in and out 
+unrelated_input <- layer_input(shape = c(64))
+bad_model <- keras_model(unrelated_input, output_tensor)
+```
+
+The error above tells use that Keras couldn't reach input_1 from the provided output tensor. 
+
+When it comes to compiling, training, or evaluating a model built this way, the API is the same as the sequential model. 
+
+```{r}
+model %>% compile( # compiles the model 
+  optimizer = "rmsprop",
+  loss = "categorical_crossentropy"
+)
+
+# generate dummy data to train on 
+x_train <- array(runif(1000 * 64), dim = c(1000, 64))
+y_train <- array(runif(1000 * 10), dim = c(1000, 10))
+
+model %>% fit(x_train, y_train, epochs = 10, batch_size = 128)
+
+model %>% evaluate(x_train, y_train)
+```
+
+## Multi input models 
+
+The functional API can be used to build models that have multiple inputs. Typically, such models at some point merge their different input branches using a layer that can combine several tensors - by adding, concatenating and so on. 
+
+Here we will build a simple multi input model consisting of a natural language question and a text sippet providing information to be used for answering the question. In the simplest possible setup, this is a one word answer obtained via a softmax over some predefined vocabulary. 
+
+```{r}
+# Functional API implementation of a two input question answering model 
+text_vocabulary_size <- 10000
+ques_vocabulary_size <- 10000
+answer_vocabulary_size <- 500
+
+# the text input is a variable length sequence of integers. Note that you can optionally name the inputs 
+text_input <- layer_input(shape = list(NULL), dtype = "int32", name = "text")
+
+encoded_text <- text_input %>% 
+  layer_embedding(input_dim = 64, output_dim= text_vocabulary_size) %>% # embeds the inputs into a sequence of vectors of size 64 
+  layer_lstm(units = 32) # Encodes the vectors into a single vector via LSTM
+
+question_input <- layer_input(shape = list(NULL),  # same process (with different layer instances) for the question 
+                              dtype = "int32", name = "Question")
+
+encoded_question <- question_input %>% 
+  layer_embedding(input_dim = 32, output_dim = ques_vocabulary_size) %>% 
+  layer_lstm(units = 32)
+
+# concatenate the encoded question and encoded text 
+concatenated <- layer_concatenate(list(encoded_text, encoded_question)) 
+
+# adds a softmax classifier on top 
+answer <- concatenated %>% 
+  layer_dense(units = answer_vocabulary_size, activation = "softmax") 
+
+# at model instantiation,, ,we specify the two inputs and the output 
+model <- keras_model(list(text_input, question_input), answer)
+
+# compile
+model %>% compile(
+  optimizer = "rmsprop",
+  loss = "categorical_crossentropy",
+  metrics = c("acc")
+)
+
+```
+
+There are two possible APIs to train the two input model: 
+  - We can feed the model a list of arrays as inputs
+  - We can feed the model a dictionary that maps input names to arrays (available only if we give names to our inputs) 
+  
+```{r}
+# feeding data to a multi input model 
+num_samples <- 1000
+max_length <- 100
+
+# generate dummy data 
+random_matrix <- function(range, nrow, ncol){
+  matrix(sample(range, size = nrow * ncol, replace = TRUE), nrow = nrow, ncol = ncol)
+}
+
+text <- random_matrix(1:text_vocabulary_size, num_samples, max_length)
+question <- random_matrix(1:ques_vocabulary_size, num_samples, max_length)
+answers <- random_matrix(0:1, num_samples, answer_vocabulary_size) # answers are one-hot encoded, not integers
+
+# fitting using a list of inputs 
+model %>% fit(
+  list(text, question), 
+  answers,
+  epochs = 10,
+  batch_size = 128
+)
+
+# fitting using a named list on inputs 
+model %>% fit(
+  list(text = text, question = question),
+  answers,
+  epochs = 10,
+  batch_size = 128
+)
+```
+
+# Multi-Output models 
+
+In the same way as above, we can make a model with multiple outputs. 
+A simple example is a network that attempts to simulatenously predict different properties of the data, such as a network that attempts to simultaneously predict different properties of the data. 
+An example is a network that takes as input a series of social media posts from a single anonymous person and tries to predict the attributes of that person, such as age, gender, and income level. 
+
+```{r}
+# Functional API implementation of a three-output-model 
+vocabulary_size <- 50000
+num_income_groups <- 10
+
+posts_input <- layer_input(shape = list(NULL),
+                           dtype = "int32", name = "posts")
+
+embedded_posts <- posts_input %>% 
+  layer_embedding(input_dim = 256, output_dim = vocabulary_size)
+
+base_model <- embedded_posts %>% 
+  layer_conv_1d(filters = 128, kernel_size = 5, activation = "relu") %>% 
+  layer_max_pooling_1d(pool_size = 5) %>% 
+  layer_conv_1d(filters = 256, kernel_size = 5, activation = "relu") %>% 
+  layer_conv_1d(filters = 256, kernel_size = 5, activation = "relu") %>% 
+  layer_max_pooling_1d(pool_size = 5) %>% 
+  layer_conv_1d(filters = 256, kernel_size = 5, activation = "relu") %>% 
+  layer_conv_1d(filters = 256, kernel_size = 5, activation = "relu") %>% 
+  layer_global_max_pooling_1d() %>% 
+  layer_dense(units = 128, activation = "relu")
+
+# note that the output layers are given names 
+age_prediction <- base_model %>% 
+  layer_dense(units = 1, name = "age")
+
+income_prediction <- base_model %>% 
+  layer_dense(num_income_groups, activation = "softmax", name = "income")
+
+gender_prediction <- base_model %>% 
+  layer_dense(units = 1, activation = "sigmoid", name = "gender")
+
+model <- keras_model(
+  posts_input, 
+  list(age_prediction, income_prediction, gender_prediction)
+)
+
+```
+
+Importantly, training such a model requires the ability to specify different loss functions for different heads of the network. For example, age prediction is a scalar regression task, but gender prediction is a binary classification task, requiring a different training procedure. Because gradient descent requires us to minimize a scalar, we must combine these losses into a single value in order to train the model. The simplest way to combine different losses is to sum them all. 
+
+In keras, we can use either a list or a named list of losses in compile to specify different objects for different outputs - the resulting loss values are summed into a global loss, which is minimized during training 
+
+```{r}
+# Compilation options of a multi output model: multiple losses 
+model %>% compile(
+  optimizer = "rmsprop",
+  loss = c("mse", "categorical_crossentropy", "binary_crossentropy")
+)
+
+# equivalent (possible only if you give names to the output layers)
+model %>% compile(
+  optimizer = "rmsprop",
+  loss = list(
+    age = "mse",
+    income = "categorical_crossentropy",
+    gender = "binary_crossentropy"
+  )
+)
+```
+
+As in the case of multi input models, we can pass data to the model for training either via a plain list of arrays or via a named list of arrays 
+
+```{r}
+# Feeding data to a multi output model 
+model %>% fit(
+  posts, 
+  list(age_targets, income_targets, gender_targets),
+  epochs = 10,
+  batch_size = 64
+)
+
+# equivalent (possible only if you give names to the output layers)
+model %>% fit(
+  posts,
+  list(
+    age = age_targets, 
+    income = income_targets,
+    gender = gender_targets
+  ),
+  epochs = 10,
+  batch_size = 64
+)
+
+```
+
+## Directed Acyclic Graphs of Layers 
+
+With the functional API we can create networks with complex inner topologies. 
+
+### Inception Modules 
+
+The inception module was developed by google in 2013 - 2014 and was inspired by a network in network architecture. 
+
+```{r}
+# implementation of a 1 2 2 3 inception network 
+
+# every branch has the same stride value (2), which is necessary to keep all branch outputs the same size so we can concatenate them
+branch_a <- input %>% 
+  layer_conv_2d(filters = 128, kernel_size = 1, activation = "relu", strides = 2) 
+
+branch_b <- input %>%
+  layer_conv_2d(filters = 128, kernel_size = 1, activation = "relu") %>% 
+  layer_conv_2d(filters = 128, kernel_size = 3, activation = "relu", strides = 2) # in this branch the striding occurs in the spatial convolution layer 
+
+branch_c <- input %>% 
+  layer_average_pooling_2d(pool_size = 3, strides = 2) %>% # in this branch the striding occurs in the average pooling layer 
+  layer_conv_2d(filters = 128, kernel_size = 3, activation = "relu")
+
+branch_d <- input %>% 
+  layer_conv_2d(filters = 128, kernel_size = 1, activation = "relu") %>% 
+  layer_conv_2d(filters = 128, kernel_size = 3, activation = "relu") %>% 
+  layer_conv_2d(filters = 128, kernel_size = 3, activation = "relu", strides = 2)
+
+# concatenate the branch outputs to obtain the module output 
+output <- layer_concatenate(list(branch_a, branch_b, branch_c, branch_d))
+```
+
+The full inception v3 architecture is prebuilt into keras as application_inception_v3, including weights pretrained on the imagenet data set. 
+Another closely related model available is Xception, which is the extreme version of inception (more layers, more seperation).
+
+## Residual Connections 
+
+Residual connections are common graph like network components found in more modern post 2015 network architectures, including Xception. 
+They tackle two common problems for large deep learning models: vanishing gradients and representational bottlenecks. In general, they are 
+beneficial for models > 10 layers. 
+
+A residual connection consists of making the output of an earlier layer available as an input to a later layer, effectively creating a shortcut in the sequential network. 
+Rather than being concatenated to the later activation, the earlier output is summed with the later activation, which assumes both transformations are the same size. 
+If they are different sizes, we can use a linear transformation to reshape the earlier activation into the target shape. 
+
+```{r}
+# implementing a residual connection when the feature map sizes are the same using identity residual connections. 
+# assumes the existence of a 4D input tensor
+output <- input %>% # applies a transformation to an input 
+  layer_conv_2d(filters = 128, kernel_size = 3, activation = "relu", padding = "same") %>% 
+  layer_conv_2d(filters = 128, kernel_size = 3, activation = "relu", padding = "same") %>% 
+  layer_conv_2d(filters = 129, kernel_size = 3, activation = "relu", padding = "same")
+
+# add the original input back to the output 
+output <- layer_add(list(output, input))
+```
+
+```{r}
+# implementing a residual connection where the feature map sizes differ, using a linear residual connection 
+# assumes the existence of a 4D input tensor 
+output <- input %>% 
+  layer_conv_2d(filters = 128, kernel_size = 3, activation = "relu", padding = "same") %>% 
+  layer_conv_2d(filters = 128, kernel_size = 3, activation = "relu", padding = "same") %>% 
+  layer_max_pooling_2d(pool_size = 2, strides = 2)
+
+# use a 1x1 convolution to linearly downsample the original input tensor to the same shape as the output 
+residual <- input %>% 
+  layer_conv_2d(filters = 128, kernel_size = 1, strides = 2, padding = "same")
+
+# adds the residual tensor back to the output features  
+output <- layer_add(list(output, residual))
+```
+
+## Representational bottlenecks in deep learning 
+
+In a sequential model, each successive representation layer is built on top of the previous one, which means it only has access to information contained in the previous layer.
+If one layer is too small (for example, features that are too low dimensioanl), then the model will be constrained by how much information can be crammed into the activations of this layer. 
+
+## Vanishing Gradients in deep learning 
+
+Backpropogation works by propogating a feedback signal from the output loss down to earlier layers. If this feedback signal has to be propagated through a deep stack of layers, the signal may become tenuous or even 
+lost entirely, rendering the network untrainable. This issue is known as vanishing gradients. 
+In recurrent nets we battle this effect by using a carry track that introduces information parallel to the main processing track. Residual conections work in a similar eay in feedforward deep networks.
+They introduce a purely linear information carry track parallel to the main layer stack, helping to propagate gradients through arbitrarily deep stacks of layers. 
+
+## Layer weight sharing 
+
+Another important feature of the functional API is the ability to reuse a layer instance several times. This allows us to build models that have shared branches - several branches that all share the same knowledge and perform the same operations. They share the same representations and learn these representations simulataneously for different sets of inputs. 
+
+A siamese network is a network that has two or more identical subnetworks in them. Siamese networks tend to work well on similarity tasks like sentence similarity, recognizing forged signatures and more. 
+
+```{r}
+# implementing a siamese LSTM model
+lstm <- layer_lstm(units = 32) # instantiates a single LSTM layer once
+
+# building the left branch of the model: inputs are variable length sequences of vectors of size 128 
+left_input <- layer_input(shape = list(NULL, 128))
+left_output <- left_input %>% lstm()
+
+# building the right branch of the model: when you call an existing layer instance, you reuse its weights 
+right_input <- layer_input(shape = list(NULL, 128))
+right_output <- right_input %>% lstm()
+
+merged <- layer_concatenate(list(left_output, right_output))
+
+# build classifier on top 
+predictions <- merged %>% 
+  layer_dense(units = 1, activation = "sigmoid")
+
+# instantiating and training the model: When we train this kind of model, the weights of the LSTM layer are updated based on both inputs 
+model <- keras_model(list(left_input, right_input), predictions) 
+model %>% fit(
+  list(left_data, right_data),
+  targets)
+
+```
+
+A layer instance can be used more than once - it can be called arbitrarily many times, reusing the same set of weights each time. 
+
+## Models as layers 
+
+In the functionala API, models can be used as layers. 
+
+Suppose we wanted to build a vision model that uses a dual camera as an input. We can share processing across the two inputs, done via layers that use the same weights and share the same representations
+
+```{r}
+# implement a siamese vision model (shared convolutional base)
+
+# the base image processing model is the Xception network (convolutional base only)
+xception_base <- application_xception(weights = NULL, include_top = FALSE)
+
+# inputs are 250 x 250 RGB images 
+left_input <- layer_input(shape = c(250, 250, 3))
+right_input <- layer_input(shape = c(250, 250, 3))
+
+# calls the same vision model twice
+left_features <- left_input %>% xception_base()
+right_features <- right_input %>% xception_base() 
+
+# the merged features contain information from the right visual feed and left visual feed 
+merged_features <- layer_concatenate(
+  list(left_features, right_features)
+)
+
+```
+
+# Inspecting and minotiring deep-learning models using Keras callbacks and TensorBoard 
+
+This section goes over ways to gain greater access and control of what goes on inside our model during training. 
+
+## Using callbacks to act on a model during training 
+
+A callback is an object that is passed to the model in the call to fit and that is called by the model at various points during training. It has access to all the available data about the state of the model and its performance and it can take action: interrupt training, save a model, load a different weight set, or otherwise alter the state of the model. 
+
+Some ways to use callbacks: 
+  - Model Checkpointing: save the current weights of the model at different points during training 
+  - Early stopping: Interrupting training when the validation loss is no longer improving (and saving the best model obtained during training)
+  - Dynamically adjusting the value of certain parameters during training: Such as the learning rate of the optimizer 
+  - Logging training and validation metrics during training, or visualizing the representations learned by the model as they're updated 
+  
+Keras includes a number of built in callbacks, including, but not limited to: 
+  callback_model_checkpoint()
+  callback_early_stopping()
+  callback_learning_rate_scheduler()
+  callback_reduce_lr_on_plateau()
+  callback_csv_logger() 
+  
+### The model checkpoint and early stopping callbacks 
+
+We can use callback_early_stopping to interrupt training once a target metric being monitored has stopped improving for a fixed number of epochs. This callback is typically used in conjunction with callback_model_checkpoint which lets us continually save the model during training (and, optionally, save only the current best model so far (best performance at the end of an epoch))
+
+```{r}
+# callbacks are passed to the model via the callbacks argument in fit, which takes a list of callbacks. We can pass any number of callbacks 
+callbacks_list <- list(
+  callback_early_stopping(    # interrupts training when improvement stops
+    monitor = "acc",          # monitors the models validation accuracy 
+    patience = 1              # interrupts training when accuracy has stopped improving for more than one epoch (that is, two epochs)
+  ),
+# saves the current weights after each epoch 
+callback_model_checkpoint(
+  filepath = "my_model.h5",      # path to the destination model file 
+  monitor = "val_loss",          # These two arguments mean we won't overwrite the model file unless val_loss has improved, which allows us to keep the best model seen during training 
+  save_best_only = TRUE
+  )
+)
+
+model %>% compile(
+  optimizer = "rmsprop",
+  loss = "binary_crossentropy",
+  metrics = c("acc")             # we monitor accuracy, so it should be part of the models metrics
+)
+
+# note that because the callback will monitor validation loss and accuracy, we need to pass validation_data to the call to fit 
+model %>% fit(
+  x, y,
+  epochs = 10,
+  batch_size = 32, 
+  callbacks = callbacks_list, 
+  validation_data = list(x_val, y_val)
+)
+```
+
+### The reduce learning rate on plateau callback 
+
+We can use this callback to reduce the learning rate when the validation loss has stopped improving. Reducing or increasing the learning rate in case of a loss plateau is an effective strategy to get out of a local minima during training 
+
+```{r}
+callbacks_list <- list(
+  callback_reduce_lr_on_plateau(
+    monitor = "val_loss",        # Monitors the models validation loss
+    factor = 0.1,                # divides the learning rate by 10 when triggered
+    patience = 10                # this callback is triggered after the validation loss has stopped improving for 10 epochs 
+  )
+)
+
+# because the callback will monitor the validation loss, you need to pass validation_data to the call to fit 
+model %>% fit(
+  x, y,
+  epochs = 10,
+  batch_size = 32, 
+  callbacks = callbacks_list,
+  validation_data = list(x_val, y_val)
+)
+
+```
+
+### Writing our own callback 
+
+We can implement any number of the following methods, which are called at various points during training: 
+
+on_epoch_begin
+on_epoch_end
+on_batch_begin
+on_batch_end
+on_train_begin
+on_train_end
+
+These methods are all called with a logs argument, which is a named lsit containing information about the previous batch, epoch or training run. Additionally, the callback has the following attributes:
+self$model - reference to the Keras model being trained 
+self$params - Named list with training parameters (verbosity, batch size, number of epochs, and so on)
+
+```{r}
+# simple example that saves a list of losses over each batch during training 
+library(R6)
+
+lossHistory <- R6Class("LossHistory", inherit = KerasCallback) 
+
+public = list(
+  losses = NULL,
+  on_batch_end = function(batch, logs = list()){     # called at the end of every training batch
+    self$losses <- c(self$losses, logs[["loss"]])    # accumulates losses from every batch in a list 
+  }
+)
+
+history <- lossHistory$new()                          # creates an instance of the callback 
+model %>% fit(
+  x, y,
+  batch_size = 128,
+  epochs = 20,
+  callbacks = list(history)                            # attaches the callback to model training 
+)
+
+str(history$losses)
+
+```
+
+## Introduction to TensorBoard: the TensorFlow visualization framework 
+
+The key purpose of tensorBoard is to help us visually monitor everything that goes on inside our model during training. TensorBoard gives us access to lots of features in our browser like: 
+  - Monitoring metrics during training
+  - Visualizing our architecture
+  - Visualizing histograms of activations and gradients 
+  - exploring embeddings in 3D 
+  
+We will demonstrate tensorboard with a 1D convnet trained on the IMDB sentiment analysis task: 
+
+```{r}
+max_features <- 1000
+max_len <- 500
+
+imdb <- dataset_imdb(num_words = max_features)
+c(c(x_train, y_train), c(x_test, y_test)) %<-% imdb 
+x_train <- pad_sequences(x_train, maxlen = max_len)
+x_test <- pad_sequences(x_test, maxlen = max_len)
+
+model <- keras_model_sequential() %>% 
+  layer_embedding(input_dim = max_features, output_dim = 128, input_length = max_len, name = "embed") %>% 
+  layer_conv_1d(filters = 32, kernel_size = 7, activation = "relu") %>% 
+  layer_max_pooling_1d(pool_size = 5) %>% 
+  layer_conv_1d(filters = 32, kernel_size = 7, activation = "relu") %>% 
+  layer_global_max_pooling_1d() %>% 
+  layer_dense(units = 1)
+
+summary(model)
+
+model %>% compile(
+  optimizer = "rmsprop",
+  loss = "binary_crossentropy", 
+  metrics = c("acc")
+)
+
+```
+
+Before we start using tensorboard, we need to create a directory where it will store the log files we create 
+
+```{r}
+dir.create("my_log_dir")
+
+# training the model with a TensorBoard callback 
+
+tensorboard("my_log_dir")    # launch tensorboard and wait for output in specified directory 
+
+callbacks = list(
+  callback_tensorboard(
+    log_dir = "my_log_dir",
+    histogram_freq = 1,       # records activation histograms at every 1 epoch
+    embeddings_freq = 1       # records embedding data at every 1 epoch 
+  )
+)
+
+history <- model %>% fit(
+  x_train, y_train, 
+  epochs = 5, 
+  batch_size = 128, 
+  validation_split = 0.2, 
+  callbacks = callbacks 
+)
+```
+
+# Getting the most out of our models 
+
+Trying out architectures blindly works well enough if we need something that works okay. We will look at what it takes from works okay to wins machine learning competitions. 
+
+## Advanced Architecture Patterns 
+
+We learned about residual connections before, now we should learn about normalization and depthwise seperable convolution.
+
+### Batch Normalization 
+
+Normalization is a broad category of methods that seek to make different samples seen by a machine learning model more similar to each other, which helps the model learn and generalize well to new data. 
+
+The most common form of data normalization is centering the data on 0 by subtracting the mean from the data and giving the data a unit standard deviation of 1.  In effect, this makes the assumption that the data follows a normal distribution and makes sure this distribution is centered and scaled to unit variance. 
+
+```{r}
+mean <- apply(train_data, 2, mean)
+std <- apply(train_data, 2, sd)
+train_data <- scale(train_data, center = mean, scale = std)
+test_data <- scale(test_data, center = mean, scale = std)
+```
+
+In previous examples we normalized data before feeding it into models, but data normalization should be a concern after every transformation operated by the network. 
+Batch normalization is a type of layer that can adaptively normalize data even as the mean and variance change over time during training. It works by internally maintaining the mean and variance of the data seen during training. The main effect of batch normalization is that it helps with gradient propagation - much like residual connections - and thus allows for deeper networks. 
+Some very deep networks can only be trained if they include multiple batch_normalization layers. 
+
+The layer_batch_normalization layer is typically used after a convolutional or densely connected layer: 
+
+```{r}
+layer_conv_2d(filters = 32, kernel_size = 3, activation = "relu") %>% 
+  layer_batch_normalization()
+
+layer_dense(units = 32, activation = "relu") %>% 
+  layer_batch_normalization()
+
+```
+
+The layer_batch_normalization layer takes an axis argument, which specifies the feature axis that should be normalized. This argument defaults to -1, the last axis in the input tensor. This is the correct value when using layer_dense, layer_conv_1d, RNN layers, and layer_conv_2d with data_format set to "channels_last". In the niche case of layer_conv_2d with data_format set to "channels_first" the feature axis is 1, and the axis argument in layer_batch_normalization should be adjusted accordingly. 
+
+### Batch Renormalization 
+
+A recent improvement to batch normalization is batch renormalization which came out in 2017. Theres also self normalizing neural networks, which manage to keep data normalized after going through any dense layer by using a specific activation function (selu) and a specific initializer (lecun_normal). Self normalizing neural networks are worth looking into, but it is limited to densely connected networks for now 
+
+### Depthwise Seperable Convolution 
+
+Depthwise seperable convolution is a replacement for layer_conv_2d that makes our model lighter (fewer trainable weight parameters), faster (fewer floating point operations) and performs a few % points better on its task.
+
+This layer performs a spatial convolution on each channel of its input, independently, before mixing output channels via a pointwise convolution. This is equivalent to seperating the learning of spatial features and the lerning of channel wise features, which makes a lot of sense if we assume that spatial locations in the input are highly correlated, but different channels are fairly independent. It uses less parameters and tends to need less data. 
+
+```{r}
+# building a lightweight, depthwise seperable convnet for image classification (softmax categorical classification) on a small dataset
+height <- 64
+width <- 64
+channels <- 3
+num_classes <- 10 
+
+model <- keras_model_sequential() %>% 
+  layer_separable_conv_2d(filters = 32, kernel_size = 3, activation = "relu", input_shape = c(height, width, channels)) %>% 
+  layer_separable_conv_2d(filters = 64, kernel_size = 3, activation = "relu") %>% 
+  layer_max_pooling_2d(pool_size = 2) %>% 
+  layer_separable_conv_2d(filters = 64, kernel_size = 3, activation = "relu") %>% 
+  layer_separable_conv_2d(filters = 128, kernel_size = 3, activation = "relu") %>% 
+  layer_max_pooling_2d(pool_size = 2) %>%
+  layer_separable_conv_2d(filters = 64, kernel_size = 3, activation = "relu") %>% 
+  layer_separable_conv_2d(filters = 128, kernel_size = 3, activation = "relu") %>% 
+  layer_global_average_pooling_2d() %>% 
+  layer_dense(units = 32, activation = "relu") %>% 
+  layer_dense(units = num_classes, activation = "softmax")
+
+model %>% compile(
+  optimizer = "rmsprop",
+  loss = "categorical_crossentropy"
+)
+
+```
+
+When it comes to large scale models, depthwise separable models are the basis of the Xception architecture. 
+
+### Hyperparameter Optimization 
+
+Theres an entire field of research that looks for automating hyperparameters. Generally, optimizing looks something like this: 
+
+  1. Choose a set of hyperparameters (automatically)
+  2. Build the corresponding model 
+  3. Fit it to our training data and measure the final performance on the validation data 
+  4. Choose the next set of hyperparameters to try 
+  5. repeat
+  6. Eventually, measure performance on our test data 
+  
+The key to this process is to find an algorithm that uses the history of validation performance, given the set of hyperparameters, to choose the next set of hyperparameters. Some techniques are bayesian optimization, genetic algorithms, simple random search, and so on. 
+
+Training the weights of a model is easier than training hyperparameters. When training weights we can use the backprop algorithm to move the weights in the right direction.
+
+Consider the following: 
+  - Computing the feedback signal (does this set of hyperparameters lead to a high performing model on this task?) can be extremely expensive. It requires creating and training a new model from scratch on our dataset. 
+  - The hyperparameter space is typically made of discrete decisions and thus isn't continuous or differentiable. Therefore, we can't do gradient descent in hyperparameter space, an d instead must rely on gradient free optimization techniques which are         naturally far less efficient than gradient descent. 
+
+Often random search (choosing parameters to evaulate at random, repeatedly) in the best solution, despite the naivety of it. 
+The tfruns package provides a set of tools that can assist with hyperparameter tuning: 
+  - tracking the hyperparameters, metrics, output, and sourc code of every training run 
+  - Comparing hyperparameters and metrics across runs to find the best performing model 
+  - automatically generating reports to visualize individual training runs or comparisons between runs 
+  
+One important issue to keep in mind when doing hyperparameter optimization is that we are optimizing to the validation set, which, when we run our optimizations repeatedly, often end up overfitting the validation set. 
+
+### Model Ensembling 
+
+Ensembling consists of pooling together the predictions of a set of different models to produce better predictions. Generally, those that win machine learning ocmpetitions on kaggle will use very large ensembles of models that inevitably beat any single model, no matter how good. 
+
+Ensembling relies on the assumption that different good models trained independelty are likely to be good for different reasons, where each model looks at a slightly different aspect of the data to make its predictions. 
+
+```{r}
+# classification example 
+
+# use four different models to compute initial predictions 
+preds_a <- model_a %>% predict(x_val)
+preds_b <- model_b %>% predict(x_val)
+preds_c <- model_c %>% predict(x_val)
+preds_d <- model_d %>% predict(x_val)
+
+# this new prediction array should be more accurate than any of the initial ones 
+final_preds <- 0.25 * (preds_a + preds_b + preds_c + preds_d)
+
+# a smarter way is to use a weighted average if they are not all equally as useful, e.g. if one provides poorer performance than the others 
+final_preds <- 0.5 * preds_a + 0.25 * preds_b + 0.1 * preds_c + 0.15 * preds_d # where the weights are learned empirically 
+```
+
+The key to making ensembling work is the diversity of a set of classifiers. If all our models are biased in the same way, then our ensemble will retain this bias. If our models are biased in different ways, the biases will cancel each other out, and our ensemble will be more robust and accurate. 
+
+One thing that doesn't work well in practice is ensembling the same network trained several times independently from different random initializations. The author has found that the ensemble of tree based methods (such as random forests or gradient boosted trees) and deep neural networks. 
+
+Its not so much how good your best model is, but the diversity of your set of candidate models. 
+
+## Wrapping Up 
+  - When building high performance deep convnets, we will need to use residual connections, batch normalization, and depthwise separable convolutions 
+  - In the future its likely that depthwise separable convolutions will completely replace regular convolutions 
+  - Building deep networks requires making many small hyperparameter choices, which will define how good our model performs
+  - tfruns package is good for helping optimize hyperparameters 
+  - Be careful about validation set overfitting when optimizing hyperparameters 
+  - Winning machine learning competitions or otherwise obtaining the best possible results can only be done with ensembles of models. 
+  
