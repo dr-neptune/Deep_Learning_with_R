@@ -1,0 +1,1026 @@
+---
+title: "Ch8_Generative_Deep_Learning"
+author: "Michael Rose"
+date: "May 27, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(keras)
+```
+
+# Text generation with LTSM 
+
+When we are generating text (or any timeseries or sequential data) with LSTM we are essentially looking at a softmax distribution to see what the next character is most likely to be. If we always choose the most likely character, it results in boring repetitive text, and if we choose from a uniform distribution across the alphabet it results in gibberish. We want to strike a balance and we can do that by controlling the amount of stochasticity in the sampling process.  
+
+We do this by introducing a parameter called the softmax temperature that characterizes the entropy of the probability distribution used for sampling. It characterizes how surprising or predictable the choice of the next character will be. 
+```{r}
+# reweighing a probability distribution to a different temperature 
+
+# original distribution is a vector of probability values that must sum to 1. Temperature is a factor quantifying the entropy of the output distribution 
+reweight_distribution <- function(original_distribution, temperature = 0.5){
+  distribution <- log(original_distribution) / temperature 
+  distribution <- exp(distribution)
+  # return a reweighted version of the original distribution. The sum of the distribution may no longer be 1, so we divide it by its sum to obtain the new distribution 
+  distribution / sum(distribution)
+}
+
+```
+
+Higher temperatures result in sampling distributions of higher entripy that will generate more surprising and unstructured generated data, whereas a lower temperature will result in less randomness and much more predictable generated data. 
+
+## Implementing character level LSTM text generation 
+
+```{r}
+# downloading and parsing the initial text file
+
+library(stringr)
+
+path <- get_file(
+  "nietzsche.txt",
+  origin = "https://s3.amazonaws.com/text-datasets/nietzsche.txt")
+
+text <- tolower(readChar(path, file.info(path)$size)) 
+cat("Corpus length:", nchar(text), "\n")
+```
+
+Next we extract partially overlapping sequences of length maxlen, onehot encode them, and pack them into a 3D array x of shape (sequences, maxlen, unique_characters). 
+Simultaneously we will prepare an array y containing the corresponding targets - the one-hot encoded characters that come after each extracted sequence 
+
+```{r}
+# vectorizing sequences of characters 
+maxlen <- 60      # we will extract sequences of 60 characters 
+step <- 3         # we will sample a new sequence every 3 characters 
+
+text_indexes <- seq(1, nchar(text) - maxlen, by = step)
+sentences <- str_sub(text, text_indexes, text_indexes + maxlen - 1)          # holds the extracted sequences 
+next_chars <- str_sub(text, text_indexes + maxlen, text_indexes + maxlen)    # holds the targets (the follow-up characters)
+
+cat("Number of sequences: ", length(sentences), "\n")
+
+chars <- unique(sort(strsplit(text, "")[[1]]))                               # list of unique characters in the corpus 
+cat("Unique characters: ", length(chars), "\n")
+
+char_indices <- 1:length(chars)                                              # named list that maps unique characters to their index 
+names(char_indices) <- chars 
+
+# one hot encode the characters into binary arrays 
+cat("Vectorization...\n")
+x <- array(0L, dim = c(length(sentences), maxlen, length(chars))) 
+y <- array(0L, dim = c(length(sentences), length(chars)))
+
+for (i in 1:length(sentences)){
+  sentence <- strsplit(sentences[[i]], "")
+  for (t in 1:length(sentence)){
+    char <- sentence[[t]]
+    x[i, t, char_indices[[char]]] <- 1
+  }
+  next_char <- next_chars[[i]]
+  y[i, char_indices[[next_char]]] <- 1
+}
+```
+
+
+### Building the network 
+
+The network is a single LSTM layer followed by a dense classifier and softmax over all possible characters. 
+
+```{r}
+# single layer lstm model for next character prediction 
+model <- keras_model_sequential() %>% 
+  layer_lstm(units = 128, input_shape = c(maxlen, length(chars))) %>% 
+  layer_dense(units = length(chars), activation = "softmax")
+
+# because our targets are onehot encoded, we will use categorical_crossentropy as the loss to train the model 
+
+# model compilation configuration 
+optimizer <- optimizer_rmsprop(lr = 0.01)
+
+model %>% compile(
+  loss = "categorical_crossentropy",
+  optimizer = optimizer
+)
+```
+
+### Training the language model and sampling from it
+
+Given a trained model and a seed text snippet, we can generate new text by doing the following repeatedly:
+  1. Draw from the model a probability distribution for the next character, given the generated text so far 
+  2. Reweigh the distribution to a certain temperature
+  3. Sample the next character at random according to the reweighted distribution
+  4. add the new character at the end of the available text
+
+```{r}
+# function to sample the next character given the models predictions 
+
+sample_next_char <- function(preds, temperature = 1.0){
+  preds <- as.numeric(preds)
+  preds <- log(preds)/temperature
+  exp_preds <- exp(preds)
+  preds <- exp_preds / sum(exp_preds)
+  which.max(t(rmultinom(1, 1, preds)))
+}
+
+# text generation loop
+
+for (epoch in 1:60){
+  
+  cat("epoch", epoch, "\n")
+  
+  # fit model
+  model %>% fit(x, y, batch_size = 128, epochs = 1)
+  
+  # select a text seed at random
+  start_index <- sample(1:(nchar(text) - maxlen - 1), 1)
+  seed_text <- str_sub(text, start_index, start_index + maxlen - 1)
+  
+  cat("--- Generating with seed:", seed_text, "\n\n")
+  
+  for (temperature in c(0.2, 0.5, 1.0, 1.2)){  # tries a different range of sampling textures
+    
+    cat("--- Temperature:", temperature, "\n")
+    cat(seed_text, "\n")
+    
+    generated_text <- seed_text 
+    
+    # generates 400 characters, starting from seed text 
+    for (i in 1:400){ 
+      
+      # one hot encodes the characters generated so far
+      sampled <- array(0, dim = c(1, maxlen, length(chars)))
+      generated_chars <- strsplit(generated_text, "")[[1]]
+      
+      for (t in 1:length(generated_chars)){
+        char <- generated_chars[[t]]
+        sampled[1, t, char_indices[[char]]] <- 1
+      }
+      # samples the next character 
+      preds <- model %>% predict(sampled, verbose = 0)
+      next_index <- sample_next_char(preds[1,], temperature)
+      next_char <- chars[[next_index]]
+      
+      generated_text <- paste0(generated_text, next_char)
+      generated_text <- substring(generated_text, 2)
+      
+      cat(next_char)
+    }
+    cat("\n\n")
+  }
+}
+
+```
+
+## Wrapping Up
+
+  - We can generate discrete sequence data by training a model to predict the next token(s), given previous tokens 
+  - In the case of text, such a model is called a language model. It can be based on either words or characters 
+  - Sampling the next token requires balance between adhering to what the model judges likely, and introducing randomness
+  - One way to handle this is the notion of softmax temperature. Always experiment with different temperatures to find the right one 
+  
+# Deep Dream 
+
+Deep dream is similar to how we visualized convnets in chapter 5, with a few differences: 
+  - We try to maximize the activation of entire layers rather than that of a specific filter, thus mixing together visualizations of large numbers of features at once 
+  - We start from an existing image as opposed to a blank noisy input 
+  - The input images are processed at different scales, which improves the quality of the visualizations 
+  
+## Implementing deepdream in keras 
+
+We will start from a convnet pretrained on ImageNet. We will use the Inception V3 model that comes with Keras. 
+
+```{r}
+# loading the pretrained inception V3 model 
+
+# we won't be training the model, so this command disables all training specific operations
+k_set_learning_phase(0)
+
+# build the inception V3 network, without its convolutional base. The model will be loaded with pretrained imagenet weights 
+model <- application_inception_v3(
+  weights = "imagenet",
+  include_top = FALSE
+)
+
+```
+
+Next we will compute the loss, which we seek to maximize during the gradient ascent process. Here we will maximize the activation of all filters in a number of layers. Specifically, we will maximize the weighted sum of the L@ norm of the activations of a set of higher level layers. 
+The set of layers we choose will have a major influence on the visuals we will be able to produce.
+
+We will start with a somewhat arbitrary configuration involving four layers, and can mess with different configurations later.
+
+```{r}
+# Setting up the deepdream configuration
+
+# named list mappling layer names to a coefficient quantifying how much the layers activation contributes to the loss we seek to maximize.
+# the layer names are hardcoded into the built in Inception V3 application
+layer_contributions <- list(
+  mixed2 = 0.2, 
+  mixed3 = 3,
+  mixed4 = 2,
+  mixed5 = 1.5
+)
+
+# defining the loss to be maximized 
+
+# creates a list that maps layer names to layer instances 
+layer_dict <- model$layers 
+names(layer_dict) <- lapply(layer_dict, function(layer) layer$name)
+
+# we define the loss by adding layer contributins to this scalar variable 
+loss <- k_variable(0)
+
+for (layer_name in names(layer_contributions)){
+  coeff <- layer_contributions[[layer_name]]
+  activation <- layer_dict[[layer_name]]$output                   # retrieves the layers output
+  scaling <- k_prod(k_cast(k_shape(activation), "float32"))
+  loss <- loss + (coeff * k_sum(k_square(activation)) / scaling)  # adds the L2 norm of the features of a layer to the loss
+}
+
+# set up the gradient ascent process 
+
+# this tensor holds the generated image: the dream 
+dream <- model$input 
+
+# compute the gradients of the dream with regard to the loss 
+grads <- k_gradients(loss, dream)[[1]]
+
+# normalize the gradients 
+grads <- grads / k_maximum(k_mean(k_abs(grads)), 1e-7)
+
+outputs <- list(loss, grads)
+# set up a keras function to retrieve the value of the loss and gradients, given an input image 
+fetch_loss_and_grads <- k_function(list(dream), outputs)
+
+eval_loss_and_grads <- function(x){
+  outs <- fetch_loss_and_grads(list(x))
+  loss_value <- outs[[1]]
+  grad_values <- outs[[2]]
+  list(loss_value, grad_values)
+}
+
+# this function runs gradient ascent for a number of iterations
+gradient_ascent <- function(x, iterations, step, max_loss = NULL){
+  for (i in 1:iterations){
+    c(loss_value, grad_values) %<-% eval_loss_and_grads(x)
+    if(!is.null(max_loss) && loss_value > max_loss)
+      break 
+    cat("...Loss value at", i, ":", loss_value, "\n")
+    x <- x + (step * grad_values)
+  }
+  x
+}
+```
+
+Now for the actual deepdream algorithm. First we will look at a list of scales at which to process the image. Each scale is larger than the previous by 40%, e.g. 1.4x size. 
+To avoid losing a lot of image detail after each successive scale up, we will reinject the los details back into the image after each scale up.
+
+```{r}
+# first, auxillary functions 
+resize_img <- function(img, size){
+  image_array_resize(img, size[[1]], size[[2]])
+}
+
+save_img <- function(img, fname){
+  img <- deprocess_image(img)
+  image_array_save(img, fname)
+}
+
+# util function to open, resize and format pictures into tensors that Inception V3 can process 
+preprocess_image <- function(image_path){
+  image_load(image_path) %>% 
+    image_to_array() %>% 
+    array_reshape(dim = c(1, dim(.))) %>% 
+    inception_v3_preprocess_input()
+}
+
+# Util function to convert a tensor into a valid image 
+deprocess_image <- function(img){
+  img <- array_reshape(img, dim = c(dim(img)[[2]], dim(img)[[3]], 3))
+  img <- img / 2      # undoes preprocessing that was performed by imagenet_preprocess_input 
+  img <- img + 0.5
+  img <- img * 255
+  
+  dims <- dim(img)
+  img <- pmax(0, pmin(img, 255))
+  dim(img) <- dims 
+  img
+}
+
+
+```
+
+
+```{r}
+# running gradient ascent over different successive scales 
+
+# playing with these parameters will let us achieve new effects 
+step <- 0.01              # gradient ascent step size
+num_octave <- 3           # number of scales at which to run gradient ascent 
+octave_scale <- 1.4       # size ratio between scales 
+iterations <- 20          # number of ascent steps to run at each scale 
+
+max_loss <- 10            # if the loss grows larger than 10, we interrupt the gradient ascent process to avoid ugly artifacts 
+
+base_image_path <- "..."  # fill in path with image we want to use 
+
+img <- preprocess_image(base_image_path)
+
+# prepares a list of shape tuples defining the different scales at which to run gradient ascent 
+original_shape <- dim(img)[-1]
+successive_shapes <- list(original_shape)
+
+for (i in 1:num_octave){
+  shape <- as.integer(original_shape / (octave_scale ^ i))
+  successive_shapes[[length(successive_shapes) + 1]]
+}
+
+# reverse the list of shapes so they're in increasing order 
+successive_shapes <- rev(successive_shapes)
+
+# resize the array of the image to the smallest scale 
+original_img <- img 
+shrunk_original_img <- resize_img(img, successive_shapes[[1]])
+
+for (shape in successive_shapes){
+  cat("Processing image shape", shape, "\n")
+  # scales up the dream image 
+  img <- resize_img(img, shape)
+  # runs gradient ascent, altering the dream 
+  img <- gradient_ascent(img, 
+                         iterations = iterations,
+                         step = step,
+                         max_loss = max_loss)
+  # scales up the smaller version of the original image: it will be pixelated
+  upscaled_shrunk_original_img <- resize_img(shrunk_original_img, shape) 
+  # computes the high quality version of the original image at this size 
+  same_size_original <- resize_img(original_img, shape)
+  # the difference between the two is the detail that was lost when scaling up
+  lost_detail <- same_size_original - upscaled_shrunk_original_img 
+  
+  # reinjects lost detail into the dream 
+  img <- img + lost_detail 
+  shrunk_original_img <- resize_img(original_img, shape) 
+  save_img(img, fname = sprintf("dream_at_scale_%s.png", paste(shape, collapse = "x")))
+}
+```
+
+## Wrapping Up
+
+  - Deepdream consists of running a convnet in reverse to generate inputs based on the representations learned by the network
+  - This process can be done for speech, music, and more 
+  
+# Neural Style Transfer
+
+Neural Style Transfer can be implemented using any pretrained convnet. Here we will use the VGG19 net. 
+
+This is the general process: 
+  1. Set up a network that computes VGG19 layer activations for the style reference image, the target image, and the generated images at the same time 
+  2. Use the elayer activations computed over these three images to define the loss function which we will minimize to achieve style transfer 
+  3. Set up a gradient descent process to minimize the loss function 
+  
+First, auxillary functions 
+
+```{r}
+# Auxillary Functions 
+
+preprocess_image <- function(path){
+  img <- image_load(path, target_size = c(ing_nrows, img_ncols)) %>% 
+    image_to_array() %>% 
+    array_reshape(c(1, dim(.)))
+  imagenet_preprocess_input(img)
+}
+
+deprocess_image <- function(x){
+  x <- x[1,,,]
+  # zero center by removing the mean pixel value from imagenet. This reverses the transformation done by imagenet_preprocess_input
+  x[,,1] <- x[,,1] + 103.939
+  x[,,2] <- x[,,2] + 116.779
+  x[,,3] <- x[,,3] + 123.68
+  # convert images from BGR to RGB. This is also part of the reversal of imagenet_preprocess_input
+  x <- x[,,c(3,2,1)]
+  x[x > 255] <- 255
+  x[x < 0] <- 0
+  x[] <- as.integer(x)/255
+  x
+}
+
+```
+
+
+
+```{r}
+# defining initial variables 
+
+# path to the image we want to transform 
+target_image_path <- "img/portrait.png"    # path to the image we want to transform 
+
+style_reference_path <- "img/transfer_style_reference.png"  # path to the style image 
+
+img <- image_load(target_image_path)   # calculates the dimensions of the generated picture 
+width <- img$size[[1]]
+height <- img$size[[2]]
+img_nrows <- 400
+img_ncols <- as.integer(width * img_nrows / height)
+
+```
+
+Now to set up the VGG19 network. It takes as input a batch of 3 images: style reference, target image, and a placeholder that will contain the generated image. 
+
+```{r}
+# Loading the pretrained VGG19 network and applying it to the three images 
+target_image <- k_constant(preprocess_image(target_image_path))
+style_reference_image <- k_constant(preprocess_image(style_reference_path))
+
+# placeholder that will contain the generated image 
+combination_image <- k_placeholder(c(1, img_nrows, img_ncols, 3))
+
+# combine the three images in a single batch 
+input_tensor <- k_concatenate(list(target_image, style_reference_image, combination_image), axis = 1)
+
+# build the VGG19 network with the batch of 3 images as input. The model will be loaded with pretrained imagenet weights 
+model <- application_vgg19(input_tensor = input_tensor,
+                           weights = "imagenet",
+                           include_top = FALSE)
+
+cat("Model loaded\n")
+
+```
+
+```{r}
+# content loss 
+content_loss <- function(base, combination){
+  k_sum(k_square(combination - base))
+}
+
+# style loss
+gram_matrix <- function(x){
+  features <- k_batch_flatten(k_permute_dimensions(x, c(3,1,2)))
+  gram <- k_dot(features, k_transpose(features))
+  gram
+}
+
+style_loss <- function(style, combination){
+  S <- gram_matrix(style)
+  C <- gram_matrix(combination)
+  channels <- 3
+  size <- img_nrows * img_ncols
+  k_sum(k_square(S - C)) / (4 * channels^2 * size^2)
+}
+
+# total variation loss operates on the pixels of the generated combination image. It encourages spatial continuity in the generated image, avoiding overly pixelated results. It can be interpreted as a regularization loss
+total_variation_loss <- function(x){
+  y_ij <- x[,1:(img_nrows - 1L), 1:(img_ncols - 1L),]
+  y_i1j <- x[,2:(img_nrows), 1:(img_ncols - 1L),]
+  y_ij1 <- x[,1:(img_nrows - 1L), 2:(img_ncols),]
+  a <- k_square(y_ij - y_i1j)
+  b <- k_square(y_ij - y_ij1)
+  k_sum(k_pow(a + b, 1.25))
+}
+
+```
+
+Depending on the style reference image and content image we use, we will likely want to tune the content_weight coefficient (contribution of the content loss to the total loss). A higher content weight means the target content will be more recognizable in the generated image. 
+
+```{r}
+# defining the final loss that we will minimize
+
+# named list that maps layer names to activation tensors 
+outputs_dict <- lapply(model$layers, `[[`, "output")
+names(outputs_dict) <- lapply(model$layers, `[[`, "name")
+
+# layer used for content loss
+content_layer <- "block5_conv2"
+
+# layers used for style loss
+style_layers = c("block1_conv1", "block2_conv1", 
+                 "block3_conv1", "block4_conv1", 
+                 "block5_conv1")
+
+# weights in the weighted average of the loss components
+total_variation_weight <- 1e-4
+style_weight <- 1.0
+content_weight <- 0.025 
+
+# We define the loss by adding all components to this scalar variable
+loss <- k_variable(0.0)
+
+# add content loss
+layer_features <- outputs_dict[[content_layer]]
+target_image_features <- layer_features[1,,,]
+combination_features <- layer_features[3,,,]
+loss <- loss + content_weight * content_loss(target_image_features, combination_features)
+
+# adds a style loss components for each target layer 
+for (layer_name in style_layers){
+  layer_features <- outputs_dict[[layer_name]]
+  style_reference_features <- layer_features[2,,,]
+  combination_features <- layer_features[3,,,]
+  sl <- style_loss(style_reference_features, combination_features)
+  loss <- loss + ((style_weight / length(style_layers)) * sl)
+}
+
+# adds the total variation loss 
+loss <- loss + (total_variation_weight * total_variation_loss(combination_image))
+```
+
+Finally, we set up the gradient descent process. The original paper optimizes with the L-BFGS algorithm, so we will use it as well with the optim() function. 
+
+
+```{r}
+# Setting up the gradient descent process
+
+# gets the gradients of the generated image with regard to the loss 
+grads <- k_gradients(loss, combination_image)[[1]]
+
+fetch_loss_and_grads <- k_function(list(combination_image), list(loss, grads))
+
+# function to fetch the value of the current loss and the current gradients 
+eval_loss_and_grads <- function(image){
+  image <- array_reshape(image, c(1, img_nrows, img_ncols, 3))
+  outs <- fetch_loss_and_grads(list(image))
+  list(
+    loss_value = outs[[1]],
+    grad_values = array_reshape(outs[[2]], dim = length(outs[[2]]))
+  )
+}
+
+library(R6)
+
+# this class wraps fetch_loss_and_grads in a way that allows us to retrieve the losses and gradients via two seperate method calls, which is requires by the optimizer we are using 
+Evaluator <- R6Class("Evaluator",
+                     public = list(
+                       loss_value = NULL,
+                       grad_values = NULL,
+                       
+                       initialize = function(){
+                         self$loss_value <- NULL
+                         self$grad_values <- NULL
+                       },
+                       
+                       loss = function(x){
+                         loss_and_grad <- eval_loss_and_grads(x)
+                         self$loss_value <- loss_and_grad$loss_value 
+                         self$grad_values <- loss_and_grad$grad_values
+                         self$loss_value
+                       },
+                       
+                       grads = function(x){
+                         grad_values <- self$grad_values
+                         self$loss_value <- NULL
+                         self$grad_values <- NULL
+                         grad_values 
+                       }
+                     ))
+evaluator <- Evaluator$new()
+```
+
+
+Finally, we can run the gradient ascent process using the L-BFGS algorithm, plotting the current generated image at each iteration of the algorithm. 
+
+```{r}
+# style transfer loop 
+iterations <- 20
+
+dms <- c(1, img_nrows, img_ncols, 3)
+
+# this is the initial state: the target image 
+x <- preprocess_image(target_image_path)
+# flattens the image because optim can only process flat vectors 
+x <- array_reshape(x, dim = length(x))
+
+# Runs the L-BFGS over the pixels of the generated image to minimize the neural style loss. Note that we have to pass the function that computes the loss and the function that computes the gradients as two seperate arguments 
+
+for (i in 1:iterations){
+  opt <- optim(
+    array_reshape(x, dim = length(x)), 
+    fn = evaluator$loss,
+    gr = evaluator$grads, 
+    method = "L-BFGS-B",
+    control = list(maxit = 15)
+  )
+  
+  cat("Loss:", opt$value, "\n")
+  
+  image <- x <- opt$par 
+  image <- array_reshape(image, dms)
+  
+  im <- deprocess_image(image)
+  plot(as.raster(im))
+}
+
+```
+
+
+This technique basically achieves a retexturing, or texture transfer. It works best with style reference images that are strongly textures and highly self similar, and with content targets that don't require high levels of detail in order to be recognizable.
+
+# Generating Images with Variational Autoencoders 
+
+We will cover variational autoencoders and generative adversarial networks in this section. 
+
+## Variational Autoencoders 
+
+In technical terms, heres how a VAE works: 
+  1. An autoencoder turns the input samples input_img into two parameters in a latent space of representations, z_mean and z_log_variance 
+  2. We randomly sample a point z from the latent normal distribution thats assumed to generate the input image, via z = z_mean + exp(z_log_variance) * epsilon where epsilon is a random tensor of small values 
+  3. A decoder module maps this point in the latent space back to the original input image 
+  
+Structurally, the VAE implementation in Keras looks like this: 
+
+```{pseudocode}
+# encode the input into a mean and variance parameter 
+c(z_mean, z_log_variance) %<-% encoder(input_img)
+
+# draws a latent point using a small random epsilon 
+z <- z_mean + exp(z_log_variance) * epsilon 
+
+# decode z back into an image 
+reconstructed_img <- decoder(z)
+
+# instantiates the autoencoder model, which maps an input image to its reconstruction 
+model <- keras_model(input_img, reconstructed_img)
+```
+
+```{r}
+# VAE autoencoder network 
+img_shape <- c(28, 28, 1)
+batch_size <- 16
+latent_dim <- 2L             # dimensionality of the latent space: a 2D plane
+
+input_img <- layer_input(shape = img_shape)
+
+# model 
+x <- input_img %>% 
+  layer_conv_2d(filters = 32, kernel_size = 3, padding = "same", activation = "relu") %>% 
+  layer_conv_2d(filters = 64, kernel_size = 3, padding = "same", activation = "relu", strides = c(2, 2)) %>% 
+  layer_conv_2d(filters = 64, kernel_size = 3, padding = "same", activation = "relu") %>% 
+  layer_conv_2d(filters = 64, kernel_size = 3, padding = "same", activation = "relu")
+
+shape_before_flattening <- k_int_shape(x)
+
+# flatten 
+x <- x %>% 
+  layer_flatten() %>% 
+  layer_dense(units = 32, activation = "relu") 
+
+# the input image ends up being encoded into these two parameters 
+z_mean <- x %>% 
+  layer_dense(units = latent_dim) 
+
+z_log_var <- x %>% 
+  layer_dense(units = latent_dim)
+```
+
+Next is the code for using z_mean and z_log_var, the parameters of the statistical distribution assumed to have produced input_img, to generate a latent space point z. 
+We will wrap some arbitrary code (built on top of keras backend primitives) into a layer_lambda, which wraps an R function into a layer. 
+In keras, everything needs to be a layer, so code that isn't part of a built in layer must be wrapped into a layer_lambda or custom layer 
+
+```{r}
+# latent space sampling function 
+sampling <- function(args){
+  c(z_mean, z_log_var) %<-% args 
+  epsilon <- k_random_normal(shape = list(k_shape(z_mean)[1], latent_dim), mean = 0, stddev = 1)
+  z_mean + k_exp(z_log_var) * epsilon
+}
+
+z <- list(z_mean, z_log_var) %>% 
+  layer_lambda(sampling)
+
+```
+
+
+```{r}
+# VAE decoder network, mapping latent space points to images
+
+# input where we feed z, the latent space variable 
+decoder_input <- layer_input(k_int_shape(z)[-1])
+
+x <- decoder_input %>% 
+  # upsample the input 
+  layer_dense(units = prod(as.integer(shape_before_flattening[-1])), activation = "relu") %>% 
+  layer_reshape(target_shape = shape_before_flattening[-1]) %>%                                                       # Reshapes z into a feature map of the same shape as the feature map just before the last layer_flatten in the encoder model 
+  layer_conv_2d_transpose(filters = 32, kernel_size = 3, padding = "same", activation = "relu", strides = c(2, 2)) %>% 
+  layer_conv_2d(filters = 1, kernel_size = 3, padding = "same", activation = "sigmoid")
+
+# instantiates the decoder model, which turns decoder_input into the decoded image
+decoder <- keras_model(decoder_input, x)
+
+# apply it to z to recover the decoded z
+z_decoded <- decoder(z)
+
+```
+
+The dual loss of a VAE doesn't fit the traditional experctation of a samplewise function of the form loss(input, target). Thus, we will set up the loss by writing a custom layer than internally uses the built in add_loss layer method to create an arbitrary loss. 
+
+```{r}
+# custom layer used to compute the VAE loss 
+library(R6)
+
+CustomVariationalLayer <- R6Class("CustomVariationalLayer", inherit = KerasLayer, public = list(
+  vae_loss = function(x, z_decoded){
+    x <- k_flatten(x)
+    z_decoded <- k_flatten(z_decoded)
+    xent_loss <- metric_binary_crossentropy(x, z_decoded)
+    kl_loss <- -5e-4 * k_mean(
+      1 + z_log_var - k_square(z_mean) - k_exp(z_log_var),
+      axis = -1L
+    )
+    k_mean(xent_loss + kl_loss)
+  },
+  # custom layers are implemented by writing a call method 
+  call = function(inputs, mask = NULL){
+    x <- inputs[[1]]
+    z_decoded <- inputs[[2]]
+    loss <- self$vae_loss(x, z_decoded)
+    self$add_loss(loss, inputs = inputs)
+    x # we don't use this output, but the layer must return something 
+    }
+))
+
+layer_variational <- function(object){
+  create_layer(CustomVariationalLayer, object, list()) # wraps the R6 class in a standard Keras layer function 
+}
+
+# calls the custom layer on the input and the decoded output to obtain the final model output 
+y <- list(input_img, z_decoded) %>% 
+  layer_variational()
+
+```
+
+Now we are ready to instantiate and train the model. Because the loss is taken care of in the custom layer, we don't specify an external loss at compile time (loss = NULL), which in turn means that we won't pass target data during training
+
+```{r}
+# training the VAE 
+vae <- keras_model(input_img, y)
+
+vae %>% compile(
+  optimizer = "rmsprop",
+  loss = NULL
+)
+
+mnist <- dataset_mnist()
+c(c(x_train, y_train), c(x_test, y_test)) %<-% mnist 
+
+x_train <- x_train / 255
+x_train <- array_reshape(x_train, dim = c(dim(x_train), 1))
+
+x_test <- x_test / 255
+x_test <- array_reshape(x_test, dim = c(dim(x_test), 1))
+
+vae %>% fit(
+  x = x_train, y = NULL, 
+  epochs = 10, 
+  batch_size = batch_size,
+  validation_data = list(x_test, NULL)
+)
+```
+
+Now we can use the decoder network to turn arbitrary latent space vectors into images 
+
+```{r}
+# sampling a grid of points from the 2D latent space and decoding them to images 
+
+# we will display a grid of 15x15 digits (255 in total)
+n <- 15
+digit_size <- 28 
+
+# transforms linearly spaced coordinates using the qnorm function to produce values of the latent variable z (because the prior of the latent space is Gaussian)
+grid_x <- qnorm(seq(0.05, 0.95, length.out = n))
+grid_y <- qnorm(seq(0.05, 0.95, length.out = n))
+
+op <- par(mfrow = c(n, n), mar = c(0,0,0,0), bg = "black")
+
+for (i in 1:length(grid_x)){
+  yi <- grid_x[[i]]
+  for(j in 1:length(grid_y)){
+    xi <- grid_y[[j]]
+    z_sample <- matrix(c(xi, yi), nrow = 1, ncol = 2)
+    # decode the batch into digit images 
+    z_sample <- t(replicate(batch_size, z_sample, simplify = "matrix")) # repeats z multiple times to form a complete batch 
+    x_decoded <- decoder %>% predict(z_sample, batch_size = batch_size)
+    digit <- array_reshape(x_decoded[1,,,], dim = c(digit_size, digit_size)) # reshapes the first digit in the batch from 28x28x1 to 28x28
+    plot(as.raster(digit))
+  }
+}
+par(op)
+```
+
+## Wrapping up 
+  - image generation with deep learning is done by learning latent spaces that capture statistical information about a dataset of images. By sampling and decoding points from a latent space, we can generate never before seen images. There are two major         tools for doing this: variational autoencoders and generative adversarial networks 
+  - VAEs result in highly structured, continuous latent representations. For this reason, they work well for doing all sorts of image editing in latent space. 
+  - GANs enable the generation of realistic single frame images by may not induce latent spaces with solid structure and high continuity 
+  
+To play with image generation more, there is also a dataset called the Large-scale Celeb faces attributes (CelebA) dataset. 
+
+# Introduction to Generative Adversarial Networks 
+
+A GAN is made of two parts: 
+  1. Generator Network - Takes as input a random vector (a random point in the latent space) and decodes it into a synthetic image 
+  2. Discriminator network (or adversary) - Takes an input image and predicts whether the image came from the training set or was created by the generator network 
+
+GANs are systems in which the optimization minimum isn't fixed. They are trying to seek an equilibrium with each other, therefore every update changes the optimization landscape. As a result, GANS are notoriously hard to train and getting a GAN to work requires lots of careful tuning of the model architecture and training parameters. 
+
+## A Schematic on GAN implementation 
+
+Schematically, a GAN looks like this 
+  1. A generator network maps vectors of shape (latent_dim) to images of shape (32, 32, 3)
+  2. A discriminator network maps images of shape (32, 32, 3) to a binary score estimating the probability that the image is real 
+  3. A gan network chains the generator and the discriminator together: gan(x) <- discriminator(generator(x)). Thus this gan network maps latent space vectors to the discriminators assessment of the realism of these latent vectors as decoded by the              generator 
+  4. We train the discriminator using examples of real and fake images along with "real"/"fake" labels, just as we would train any regular image classification model 
+  5. To train the generator, we use gradients of the generators weights with regard to the loss if the gan model. This means, at every step, we move the weights of the generator in a direction that makes the discriminator more likely to classify as real the      images decoded by the generator. In other words, we train the generator to fool the discriminator 
+  
+## A bag of tricks 
+
+The process of training and tuning gans is notoriously hard, so here are some tricks that may help: 
+  - We can use tanh as the last activation in the generator instead of sigmoid
+  - We sample points from the latent space using a normal distribution as opposed to a uniform distribution 
+  - Stochasticisity is helpful for inducing robustness. Since GAN optimizes through equilibrium, its prone to getting stuck. Introducing randomness helps prevent this. We can introduce randomness by using dropout in the discriminator and by adding random       noise to the labels for the discriminator. 
+  - Sparse gradients can hinder GAN training. In regular deep learning its desirable and happens through max pooling operations and relu activation. Instead of max pooling we can use strided convolutions for downsampling and we can use                          layer_activation_leaky_relu instead of relu activation. 
+  - In generated images, its common to get checkerboard artifacrs caused by unequal coverage of the pixel pace in the generator. To fix trhis, we use a kernel size thats divisible by the stride size whenevr we use a strided layer_conv_2d_transpose or          layer_conv_2d in both the generator and discriminator
+  
+## The Generator
+
+```{r}
+# GAN generator network 
+
+latent_dim <- 32
+height <- 32
+width <- 32
+channels <- 3
+
+generator_input <- layer_input(shape = c(latent_dim))
+
+generator_output <- generator_input %>% 
+  # transforms the input into a 16x16, 128 channel feature map 
+  layer_dense(units = 128 * 16 * 16) %>% 
+  layer_activation_leaky_relu() %>% 
+  layer_reshape(target_shape = c(16, 16, 128)) %>% 
+  layer_conv_2d(filters = 256, kernel_size = 5, padding = "same") %>% 
+  layer_activation_leaky_relu() %>% 
+  # upsamples to 32x32
+  layer_conv_2d_transpose(filters = 256, kernel_size = 4, strides = 2, padding = "same") %>% 
+  layer_activation_leaky_relu() %>% 
+  layer_conv_2d(filters = 256, kernel_size = 5, padding = "same") %>% 
+  layer_activation_leaky_relu() %>% 
+  layer_conv_2d(filters = 256, kernel_size = 5, padding = "same") %>% 
+  layer_activation_leaky_relu() %>% 
+  # produces a 32x32 3 channel feature map (shape of a CIFARIO image)
+  layer_conv_2d(filters = channels, kernel_size = 7, activation = "tanh", padding = "same")
+
+# instantiates the generator model, which maps the input of shape (latent_dim) into an image of shape (32, 32, 3)
+generator <- keras_model(generator_input, generator_output)
+```
+
+## The Discriminator
+
+```{r}
+# The GAN discriminator network 
+discriminator_input <- layer_input(shape = c(height, weight, channels))
+
+discriminator_output <- discriminator_input %>% 
+  layer_conv_2d(filters = 128, kernel_size = 3) %>% 
+  layer_activation_leaky_relu() %>% 
+  layer_conv_2d(filters = 128, kernel_size = 4, strides = 2) %>% 
+  layer_activation_leaky_relu() %>% 
+  layer_conv_2d(filters = 128, kernel_size = 4, strides = 2) %>% 
+  layer_activation_leaky_relu() %>% 
+  layer_conv_2d(filters = 128, kernel_size = 4, strides = 2) %>% 
+  layer_activation_leaky_relu() %>% 
+  layer_flatten() %>% 
+  layer_dropout(rate = 0.4) %>% # one dropout layer, an important trick! 
+  layer_dense(units = 1, activation = "sigmoid") # classification layer 
+
+# instantiates the discriminator model, which turns a (32,32,3) input into a binary classification decision (fake/real)
+discriminator <- keras_model(discriminator_input, discriminator_output)
+
+discriminator_optimizer <- optimizer_rmsprop(
+  lr = 0.0008, 
+  clipvalue = 1.0, # uses gradient clipping (by value) in the optimizer
+  decay = 1e-8 # to stabilize training, uses learning rate decay 
+)
+
+discriminator %>% compile(
+  optimizer = discriminator_optimizer, 
+  loss = "binary_crossentropy"
+)
+```
+
+
+## The Adversarial network 
+
+Now we will chain together the generator and discriminator to make the GAN. Its important to note that we set the discriminator to be frozen during training so that its weights won't be updated while training. If the discrininator weights could be updated during this process, then we'd be training the discriminator to always predict real, which isn't what we want 
+
+```{r}
+# adversarial network 
+
+# sets the discriminator weights to non trainable (this will only apply to the gan model)
+freeze_weights(discriminator)
+
+gan_input <- layer_input(shape = c(latent_dim))
+gan_output <- discriminator(generator(gan_input))
+gan <- keras_model(gan_input, gan_output)
+
+gan_optimizer <- optimizer_rmsprop(
+  lr = 0.0004, 
+  clipvalue = 1.0,
+  decay = 1e-8
+)
+
+gan %>% compile(
+  optimizer = gan_optimizer, 
+  loss = "binary_crossentropy"
+)
+```
+
+## How to train our Deep Convolutional Generative Adversarial Network 
+
+This is what the training loop looks like schematically for each epoch: 
+  1. Draw random points in the latent space 
+  2. Generate images with generator using this random noise 
+  3. Mix the generated images with real ones 
+  4. Train discriminator using these mixed images, with corresponding targets: either real or fake 
+  5. Draw new random points in the latent space 
+  6. Train gan using these random vectors, with targets that all say "these are real images." This updates the weights of the generator (only because the discriminator is frozen inside gan) to move them toward getting the discriminator to predict "these are      real images" for generated images: this trains the generator to fool the discriminator. 
+
+```{r}
+# Implementing GAN training 
+
+# loads CIFARIO data 
+cifar10 <- dataset_cifar10()
+c(c(x_train, y_train), c(x_test, y_test)) %<-% cifar10
+
+# selects frog images (class 6)
+x_train <- x_train[as.integer(y_train) == 6,,,]
+x_train <- t_train / 255 # normalizes data 
+
+iterations <- 10000
+batch_size <- 20
+save_dir <- "~/Desktop" # specifies where we want to save generated images
+
+start <- 1 
+
+for (step in 1:iterations){
+  # samples random points in the latent space 
+  random_latent_vectors <- matrix(rnorm(batch_size * latent_dim), nrow = batch_size, ncol = latent_dim)
+  
+  # decodes them to fake images 
+  generated_images <- generator %>% predict(random_latent_vectors)
+  
+  # combines them with real images 
+  stop <- start + batch_size - 1
+  real_images <- x_train[start:stop,,,]
+  rows <- nrow(real_images)
+  combined_images <- array(0, dim = c(rows * 2, dim(real_images)[-1]))
+  combined_images[1:rows,,,] <- generated_images 
+  combined_images[(rows+1):(rows*2),,,] <- real_images 
+  
+  # assembles labels, discriminated real from fake images 
+  labels <- rbind(matrix(1, nrow = batch_size, ncol = 1),
+                  matrix(0, nrow = batch_size, ncol = 1))
+  
+  # adds random noise to the labels - an important trick! 
+  labels <- labels + (0.5 * array(runif(prod(dim(labels))), dim = dim(labels)))
+  
+  # trains the discriminator 
+  d_loss <- discriminator %>% train_on_batch(combined_images, labels)
+  
+  # samples random points in the latent space 
+  random_latent_vectors <- matrix(rnorm(batch_size * latent_dim),
+                                  nrow = batch_size, ncol = latent_dim)
+  
+  # assembles labels that say "these are all real images" (its a lie)
+  misleading_targets <- array(0, dim = c(batch_size, 1))
+  
+  # trains the generator (via the gan model, there the discriminator weights are frozen)
+  a_loss <- gan %>% train_on_batch(
+    random_latent_vectors, 
+    misleading_targets
+  )
+  
+  start <- start + batch_size
+  if (start > (nrow(x_train) - batch_size))
+    start <- 1
+  
+  # occasionally saves images 
+  if(step %% 100 == 0){
+    save_model_weights_hdf5(gan, "gan.h5") # saves model weights 
+    # print metrics
+    cat("discriminator loss:", d_loss, "\n")
+    cat("adversarial loss:", a_loss, "\n")
+    
+    # saves one generated image
+    image_array_save(
+      generated_images[1,,,] * 255, 
+      path = file.path(save_dir, paste0("generated_frog", step, ".png"))
+    )
+    
+    # saves one real image for comparison 
+    image_array_save(
+      real_images[1,,,] * 255, 
+      path = file.path(save_dir, paste0("real_frog", step, ".png"))
+    )
+  }
+}
+
+```
+
+If we see the adversarial loss increase considerable while the discriminative loss tends to 0 - the discriminator may end up dominating the generator. If thats the case, try reducing the discriminator learning rate, and increase the dropout rate of the discriminator. 
